@@ -42,6 +42,27 @@ def get_ref_results(a_fp4, b_fp4, a_sf, b_sf, a_global_scale, b_global_scale,
     return torch.matmul(a_in_dtype, b_in_dtype.t())
 
 
+def calculate_cosine_similarity(vec1, vec2):
+
+    if vec1 is None or vec2 is None:
+        return None
+
+    import numpy as np
+    
+    vec1 = vec1.to(torch.float32).cpu().numpy().flatten()
+    vec2 = vec2.to(torch.float32).cpu().numpy().flatten()
+    
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    cosine_sim = dot_product / (norm1 * norm2)
+    return cosine_sim
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
@@ -75,7 +96,14 @@ def test_nvfp4_gemm(
     out = ops.cutlass_scaled_fp4_mm(a_fp4, b_fp4, a_scale_interleaved,
                                     b_scale_interleaved, alpha, dtype)
 
+    cosine_similarity = calculate_cosine_similarity(out, expected_out.to(dtype=dtype))
+    print(f"cosine_similarity = {cosine_similarity}")
+
     torch.testing.assert_close(out,
                                expected_out.to(dtype=dtype),
                                atol=1e-1,
                                rtol=1e-1)
+
+if __name__ == "__main__":
+    test_nvfp4_gemm(dtype=torch.bfloat16, shape=(62, 7168, 5120), seed=42, device="cuda:0")
+    print("Passed!")

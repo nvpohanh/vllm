@@ -126,6 +126,7 @@ class Llama4Attention(nn.Module):
                  cache_config: Optional[CacheConfig] = None,
                  prefix: str = "") -> None:
         super().__init__()
+        self.prefix = prefix
         self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
         self.no_rope_layers = config.no_rope_layers
@@ -217,7 +218,27 @@ class Llama4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+
+        should_print = torch.count_nonzero(positions) > 0 and positions.shape[0] > 1 and self.prefix == "language_model.model.layers.0.self_attn"
+        if should_print:
+            print(f"self.prefix = {self.prefix}")
+            print(f">>>> hidden_states = {hidden_states}")
+            print(f">>>> positions = {positions}")
+            print(f">>>> self.qkv_proj.quant_method = {self.qkv_proj.quant_method}")
+            print(f">>>> self.qkv_proj.weight = {self.qkv_proj.weight}")
+            print(f">>>> self.qkv_proj.input_scale = {self.qkv_proj.input_scale}")
+            print(f">>>> self.qkv_proj.weight_scale = {self.qkv_proj.weight_scale}")
+            from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4LinearMethod
+            if isinstance(self.qkv_proj.quant_method, ModelOptNvFp4LinearMethod):
+                print(f">>>> self.qkv_proj.weight_scale_2 = {self.qkv_proj.weight_scale_2}")
+            self.qkv_proj.should_print = True
+        else:
+            self.qkv_proj.should_print = False
+
         qkv, _ = self.qkv_proj(hidden_states)
+
+        if should_print:
+            print(f">>>> qkv = {qkv}")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.rotary_emb is not None:
@@ -227,6 +248,11 @@ class Llama4Attention(nn.Module):
             q = self.qk_norm(q.float()).reshape(-1, self.q_size).to(q.dtype)
             k = k.reshape(-1, self.num_kv_heads, self.head_dim)
             k = self.qk_norm(k.float()).reshape(-1, self.kv_size).to(k.dtype)
+
+        if should_print:
+            print(f">>>> q = {q}")
+            print(f">>>> k = {k}")
+            print(f">>>> v = {v}")
 
         # We are applying temperature tuning (https://arxiv.org/abs/2501.19399)
         # to NoPE layers, where the inference-time temperature tuning function
@@ -240,7 +266,15 @@ class Llama4Attention(nn.Module):
             attn_scale = self._get_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
+
+        if should_print:
+            print(f">>>> attn_output = {attn_output}")
+
         output, _ = self.o_proj(attn_output)
+
+        if should_print:
+            print(f">>>> output = {output}")
+
         return output
 
 
@@ -422,10 +456,20 @@ class Llama4Model(LlamaModel):
             num_experts=1)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        print(f"In load_weights()")
+
         for name, loaded_weight in weights:
+
+            should_print = ("layers.0.self_attn." in name and ("q_proj" in name or "k_proj" in name or "v_proj" in name))
+            if should_print:
+                print(f"!!!! name = {name}")
+                print(f"!!!!!! loaded_weight = {loaded_weight}")
+
             if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                 fused_experts_params = True
                 expert_params_mapping = expert_params_mapping_fused
+
             if (self.quant_config is not None and
                 (scale_name := self.quant_config.get_cache_scale(name))):
                 # Loading kv cache quantization scales
@@ -437,6 +481,7 @@ class Llama4Model(LlamaModel):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name or "experts" in name:
                     continue

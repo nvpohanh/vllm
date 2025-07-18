@@ -198,12 +198,29 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.fp8_linear.apply(input=x,
+
+        should_print = hasattr(layer, "should_print") and layer.should_print
+        if should_print:
+            print(f"$$$$ x = {x}")
+            print(f"$$$$ bias = {bias}")
+            print(f"$$$$ layer.weight = {layer.weight}")
+            print(f"$$$$ layer.weight_scale = {layer.weight_scale}")
+            print(f"$$$$ layer.input_scale = {layer.input_scale}")
+            original_weight = (layer.weight.t().to(torch.float32) * layer.weight_scale.to(torch.float32)).to(torch.bfloat16)
+            print(f"$$$$ original_weight.shape = {original_weight.shape}")
+            print(f"$$$$ original_weight = {original_weight}")
+            torch.save(original_weight, "original_weight_fp8.pt")
+
+        out = self.fp8_linear.apply(input=x,
                                      weight=layer.weight,
                                      weight_scale=layer.weight_scale,
                                      input_scale=layer.input_scale,
                                      bias=bias)
 
+        if should_print:
+            print(f"$$$$ out = {out}")
+            torch.save(out, "out_fp8.pt")
+        return out
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt FP8.
@@ -521,6 +538,112 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+from vllm.scalar_type import scalar_types
+
+FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
+FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+kE2M1ToFloat = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.],
+                            dtype=torch.float32)
+
+
+def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
+    m_tiles = (m + 128 - 1) // 128
+    f = block_size * 4
+    k_tiles = (k + f - 1) // f
+    tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
+    tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
+    out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
+    return out[0:m, 0:k]
+
+
+def dequantize_nvfp4_to_dtype(tensor_fp4,
+                              tensor_sf,
+                              global_scale,
+                              dtype,
+                              device,
+                              block_size=16):
+    """Dequantize the fp4 tensor back to high precision."""
+    # Two fp4 values are packed into one uint8.
+    assert tensor_fp4.dtype == torch.uint8
+    m, packed_k = tensor_fp4.shape
+    k = packed_k * 2
+    tensor_f32 = break_fp4_bytes(tensor_fp4, dtype)
+    tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
+    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
+    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
+    tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
+
+    # scale the tensor
+    out = (tensor_f32 * tensor_sf_dtype.unsqueeze(-1)).reshape(m, k)
+    return out.to(dtype=dtype)
+
+
+def break_fp4_bytes(a, dtype):
+    assert a.dtype == torch.uint8
+    m, n = a.shape
+
+    # Vectorized nibble processing
+    a_flat = a.flatten()
+    high = (a_flat & 0xF0) >> 4  # Upper nibbles
+    low = a_flat & 0x0F  # Lower nibbles
+
+    # Combine nibbles for batch processing
+    combined = torch.stack((low, high), dim=1).flatten()
+
+    # Vectorized sign and magnitude extraction
+    signs = (combined & 0x08).to(torch.bool)  # Sign bits
+    abs_vals = (combined & 0x07).to(torch.long)  # Magnitude indices
+
+    # Device-aware lookup and sign application
+    kE2M1 = kE2M1ToFloat.to(device=a.device)
+    values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
+
+    # Reshape to final form
+    return values.reshape(m, n * 2).to(dtype=dtype)
+
+
+def get_ref_results(a_fp4, b_fp4, a_sf, b_sf, a_global_scale, b_global_scale,
+                    m, n, dtype, block_size, device):
+    _, m_k = a_fp4.shape
+    _, n_k = b_fp4.shape
+    assert (m_k == n_k)
+    a_in_dtype = dequantize_nvfp4_to_dtype(a_fp4,
+                                           a_sf,
+                                           a_global_scale,
+                                           dtype=dtype,
+                                           device=device,
+                                           block_size=block_size)
+    b_in_dtype = dequantize_nvfp4_to_dtype(b_fp4,
+                                           b_sf,
+                                           b_global_scale,
+                                           dtype=dtype,
+                                           device=device,
+                                           block_size=block_size)
+    return torch.matmul(a_in_dtype, b_in_dtype.t())
+
+
+def calculate_cosine_similarity(vec1, vec2):
+
+    if vec1 is None or vec2 is None:
+        return None
+
+    import numpy as np
+    
+    vec1 = vec1.to(torch.float32).cpu().numpy().flatten()
+    vec2 = vec2.to(torch.float32).cpu().numpy().flatten()
+    
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    cosine_sim = dot_product / (norm1 * norm2)
+    return cosine_sim
+
+
 class ModelOptNvFp4LinearMethod(LinearMethodBase):
     """Linear method for Model Optimizer NVFP4.
     Supports loading NVFP4 checkpoints with the following structure:
@@ -555,6 +678,11 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        should_print = layer.prefix == "language_model.model.layers.0.self_attn.qkv_proj"
+        if should_print:
+            print(f"in ModelOptNvFp4LinearMethod.create_weights()")
+            print(f">>>>>> layer.prefix = {layer.prefix}")
+
         del input_size, output_size
         if not self.quant_config.is_checkpoint_nvfp4_serialized:
             raise ValueError("NVFP4 quantization was selected, "
@@ -590,11 +718,17 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                                               weight_loader=weight_loader)
         layer.register_parameter("input_scale", input_scale)
 
+        if should_print:
+            print(f">>>>>> input_scale = {input_scale}")
+
         # Global Weight Scale
         weight_scale_2 = PerTensorScaleParameter(data=torch.empty(
             len(output_partition_sizes), dtype=torch.float32),
                                                  weight_loader=weight_loader)
         layer.register_parameter("weight_scale_2", weight_scale_2)
+
+        if should_print:
+            print(f">>>>>> weight_scale_2 = {weight_scale_2}")
 
         # Per Block Weight Scale
         weight_scale = ModelWeightParameter(data=torch.empty(
@@ -633,12 +767,27 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
 
+        should_print = layer.prefix == "language_model.model.layers.0.self_attn.qkv_proj"
+        if should_print:
+            print(f"in ModelOptNvFp4LinearMethod.process_weights_after_loading()")
+            print(f">>>>>> layer.prefix = {layer.prefix}")
+
+        if should_print:
+            print(f">>>>>> layer.input_scale = {layer.input_scale}")
+            print(f">>>>>> layer.input_scale.max() = {layer.input_scale.max()}")
+            print(f">>>>>> layer.weight_scale_2 = {layer.weight_scale_2}")
+            print(f">>>>>> layer.weight_scale_2.max() = {layer.weight_scale_2.max()}")
+
         # global scales:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         layer.input_scale = Parameter(input_scale_2, requires_grad=False)
 
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
+
+        if should_print:
+            print(f">>>>>> input_scale_2 = {input_scale_2}")
+            print(f">>>>>> weight_scale_2 = {weight_scale_2}")
 
         layer.alpha = Parameter(layer.input_scale * layer.weight_scale_2,
                                 requires_grad=False)
@@ -648,7 +797,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # block_size = 16;
         assert (layer.weight_scale.dtype == torch.float8_e4m3fn), (
             "Weight Block scale must be represented as FP8-E4M3")
+
         swizzled_weight_scale = self.swizzle_blockscale(layer.weight_scale)
+
+        if should_print:
+            print(f">>>>>> layer.weight_scale.shape = {layer.weight_scale.shape}")
+            print(f">>>>>> swizzled_weight_scale.shape = {swizzled_weight_scale.shape}")
 
         layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,
                                                 requires_grad=False)
@@ -680,6 +834,8 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         output_dtype = x.dtype
         output_shape = [x.shape[0], layer.weight.shape[0]]
 
+        should_print = hasattr(layer, "should_print") and layer.should_print
+
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         s_quant = 1 / layer.input_scale
         x_fp4, x_blockscale = scaled_fp4_quant(x, s_quant)
@@ -697,6 +853,75 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                                     output_dtype)
         if bias is not None:
             out = out + bias
+
+        if should_print:
+            print(f"$$$$ x_fp4 = {break_fp4_bytes(x_fp4, torch.bfloat16)}")
+            print(f"$$$$ x_blockscale = {x_blockscale}")
+            print(f"$$$$ layer.weight = {break_fp4_bytes(layer.weight, torch.bfloat16)}")
+            print(f"$$$$ layer.weight_scale = {layer.weight_scale}")
+            print(f"$$$$ layer.weight_scale_swizzled = {layer.weight_scale_swizzled}")
+            print(f"$$$$ layer.alpha = {layer.alpha}")
+            print(f"$$$$ bias = {bias}")
+            ref_out = get_ref_results(x_fp4, layer.weight, x_blockscale, layer.weight_scale_swizzled, 1.0 / layer.alpha, 1.0,
+                    x.shape[0], layer.weight.shape[0], output_dtype, 16, x.device)
+            print(f"$$$$ out = {out}")
+            print(f"$$$$ ref_out = {ref_out}")
+            print(f"$$$$ calculate_cosine_similarity(out, ref_out) = {calculate_cosine_similarity(out, ref_out)}")
+            original_weight = dequantize_nvfp4_to_dtype(layer.weight, layer.weight_scale_swizzled, 1.0 / layer.weight_scale_2, torch.float32, x.device, 16)
+            print(f"$$$$ original_weight = {original_weight}")
+            torch.save(original_weight, "original_weight_fp4.pt")
+            direct_ref = torch.matmul(x.to(torch.float32), original_weight.t()).to(output_dtype)
+            print(f"$$$$ direct_ref = {direct_ref}")
+            print(f"$$$$ calculate_cosine_similarity(out, direct_ref) = {calculate_cosine_similarity(out, direct_ref)}")
+
+            fp8_orig_weight = torch.load("original_weight_fp8.pt")
+            direct_ref_fp8 = torch.matmul(x.to(torch.float32), fp8_orig_weight.t().to(torch.float32)).to(output_dtype)
+            print(f"$$$$ direct_ref_fp8 = {direct_ref_fp8}")
+            print(f"$$$$ calculate_cosine_similarity(out, direct_ref_fp8)= {calculate_cosine_similarity(out, direct_ref_fp8)}")
+
+            fp8_orig_weight_fp4, fp8_orig_weight_sf = scaled_fp4_quant(fp8_orig_weight, 1.0 / layer.weight_scale_2)
+            print(f"$$$$ fp8_orig_weight_fp4 = {break_fp4_bytes(fp8_orig_weight_fp4, torch.bfloat16)}")
+            print(f"$$$$ fp8_orig_weight_sf = {fp8_orig_weight_sf}")
+            ref_out_fp8 = get_ref_results(x_fp4, fp8_orig_weight_fp4, x_blockscale, fp8_orig_weight_sf, 1.0 / layer.alpha, 1.0,
+                    x.shape[0], fp8_orig_weight_fp4.shape[0], output_dtype, 16, x.device)
+            print(f"$$$$ ref_out_fp8 = {ref_out_fp8}")
+            print(f"$$$$ calculate_cosine_similarity(out, ref_out_fp8) = {calculate_cosine_similarity(out, ref_out_fp8)}")
+            print(f"$$$$ calculate_cosine_similarity(direct_ref_fp8, ref_out_fp8) = {calculate_cosine_similarity(direct_ref_fp8, ref_out_fp8)}")
+
+            weight_fp4_fixed = torch.cat(
+                [layer.weight.data.reshape(56, 64, 2, 2560)[:48].permute(0, 2, 1, 3).reshape(6144, 2560), layer.weight.data.reshape(56, 64, 2, 2560)[48:].reshape(1024, 2560)], dim=0)
+            print(f"$$$$ weight_fp4_fixed = {break_fp4_bytes(weight_fp4_fixed, torch.bfloat16)}")
+
+            weight_scale_swizzled_fixed = torch.cat(
+                [layer.weight_scale_swizzled.data.reshape(56, 80, 32, 2, 2, 4)[0:48].permute(0, 1, 4, 2, 3, 5).reshape(48, 80*32*4*4), layer.weight_scale_swizzled.data.reshape(56, 80, 32, 2, 2, 4)[48:].reshape(8, 80*32*4*4)], dim=0).reshape(7168, 320)
+            print(f"$$$$ weight_scale_swizzled_fixed = {weight_scale_swizzled_fixed}")
+
+            weight_scale_diff = torch.max(torch.abs(weight_scale_swizzled_fixed.to(torch.float32) - fp8_orig_weight_sf.to(torch.float32)))
+            weight_scale_cos = calculate_cosine_similarity(weight_scale_swizzled_fixed.to(torch.float32), fp8_orig_weight_sf.to(torch.float32))
+            print(f"$$$$ weight_scale_diff = {weight_scale_diff}")
+            print(f"$$$$ weight_scale_cos = {weight_scale_cos}")
+
+            original_weight_fixed = dequantize_nvfp4_to_dtype(weight_fp4_fixed, weight_scale_swizzled_fixed, 1.0 / layer.weight_scale_2, torch.float32, x.device, 16)
+            print(f"$$$$ original_weight_fixed = {original_weight_fixed}")
+
+            original_weight_diff = torch.max(torch.abs(original_weight_fixed.to(torch.float32) - fp8_orig_weight.to(torch.float32)))
+            original_weight_cos = calculate_cosine_similarity(original_weight_fixed.to(torch.float32), fp8_orig_weight.to(torch.float32))
+            print(f"$$$$ original_weight_diff = {original_weight_diff}")
+            print(f"$$$$ original_weight_cos = {original_weight_cos}")
+
+            out_fixed = cutlass_scaled_fp4_mm(x_fp4, weight_fp4_fixed, x_blockscale,
+                                    weight_scale_swizzled_fixed, layer.alpha,
+                                    output_dtype)
+            print(f"$$$$ out_fixed = {out_fixed}")
+            print(f"$$$$ calculate_cosine_similarity(out, out_fixed) = {calculate_cosine_similarity(out, out_fixed)}")
+            print(f"$$$$ calculate_cosine_similarity(direct_ref_fp8, out_fixed) = {calculate_cosine_similarity(direct_ref_fp8, out_fixed)}")
+
+            torch.save(break_fp4_bytes(layer.weight, torch.float32), "weight_fp4.pt")
+            torch.save(break_fp4_bytes(fp8_orig_weight_fp4, torch.float32), "fp8_orig_weight_fp4.pt")
+            torch.save(layer.weight_scale.data, "weight_scale.pt")
+            torch.save(layer.weight_scale_swizzled.data, "weight_scale_swizzled.pt")
+            torch.save(fp8_orig_weight_sf.data, "fp8_orig_weight_sf.pt")
+
         return out.view(*output_shape)
 
 

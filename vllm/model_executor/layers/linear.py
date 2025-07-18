@@ -252,6 +252,8 @@ class LinearBase(torch.nn.Module):
     ):
         super().__init__()
 
+        self.prefix = prefix
+
         # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
