@@ -658,6 +658,7 @@ steps:
   - vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
   - vllm/v1/attention/backends/flashinfer.py
   - vllm/compilation/fusion.py
+  - vllm/compilation/fusion_attn.py
   commands:
     - nvidia-smi
     - python3 examples/offline_inference/basic/chat.py
@@ -675,6 +676,7 @@ steps:
     # Fusion
     - pytest -v -s tests/compile/test_fusion_all_reduce.py
     - pytest -v -s tests/kernels/moe/test_flashinfer.py
+    - pytest -v -s tests/compile/test_fusion_attn.py::test_attention_quant_pattern
 
 #####  1 GPU test  #####
 #####  multi gpus test  #####
