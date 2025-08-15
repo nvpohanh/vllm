@@ -48,9 +48,6 @@ class PostGradPassManager(CustomGraphPass):
             if pass_.is_applicable_for_shape(shape):
                 pass_(graph)
 
-        # Eliminate dead code after all passes
-        graph.eliminate_dead_code()
-
         # always run fix_functionalization last
         self.fix_functionalization(graph)
 

@@ -266,6 +266,7 @@ class AttnFusionPass(VllmInductorPass):
         self.dump_graph(graph, "before_attn_fusion")
 
         count = self.patterns.apply(graph)
+        graph.eliminate_dead_code()
         logger.debug("Fused quantization onto %s attention nodes", count)
         self.dump_graph(graph, "after_attn_fusion")
         self.end_and_log()
