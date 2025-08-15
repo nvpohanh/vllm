@@ -12,7 +12,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    CUTLASS_FP8_SUPPORTED, Fp8LinearOp)
+    Fp8LinearOp)
 from vllm.platforms import current_platform
 
 from .backend import TestBackend
@@ -20,8 +20,7 @@ from .backend import TestBackend
 
 class TestModel(torch.nn.Module):
 
-    def __init__(self, hidden_size: int, cutlass_fp8_enabled: bool, *args,
-                 **kwargs):
+    def __init__(self, hidden_size: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.silu_and_mul = SiluAndMul()
         self.wscale = torch.rand(1, dtype=torch.float32)
@@ -32,7 +31,6 @@ class TestModel(torch.nn.Module):
             hidden_size).to(dtype=current_platform.fp8_dtype()).t())
 
         self.fp8_linear = Fp8LinearOp(
-            cutlass_fp8_supported=cutlass_fp8_enabled,
             act_quant_static=True,
             act_quant_group_shape=GroupShape.PER_TENSOR,
         )
@@ -48,12 +46,9 @@ class TestModel(torch.nn.Module):
 
 @pytest.mark.parametrize("num_tokens", [256])
 @pytest.mark.parametrize("hidden_size", [64])
-@pytest.mark.parametrize("cutlass_fp8_enabled",
-                         [True, False] if CUTLASS_FP8_SUPPORTED else [False])
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda", "rocm"],
                     reason="Only test on CUDA and ROCm")
-def test_fusion_silu_and_mul_quant(num_tokens, hidden_size,
-                                   cutlass_fp8_enabled):
+def test_fusion_silu_and_mul_quant(num_tokens, hidden_size):
     torch.set_default_device("cuda")
     torch.set_default_dtype(torch.float16)
 
@@ -64,7 +59,7 @@ def test_fusion_silu_and_mul_quant(num_tokens, hidden_size,
     fusion_pass = ActivationQuantFusionPass(config)
 
     backend = TestBackend(NoOpEliminationPass(config), fusion_pass)
-    model = TestModel(hidden_size, cutlass_fp8_enabled)
+    model = TestModel(hidden_size)
 
     # First dimension dynamic
     x = torch.rand(num_tokens, hidden_size * 2)
