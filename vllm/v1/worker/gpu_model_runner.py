@@ -3286,3 +3286,66 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     mamba_type=mamba_module.mamba_type)
 
         return kv_cache_spec
+
+    def _build_encoder_only_attn_metadata(
+            self, scheduler_output: "SchedulerOutput") -> \
+                dict[str, tuple[CommonAttentionMetadata, Any]]:
+        """Prepare encoder attention metadata for encoder-only models.
+
+        Args:
+            scheduler_output: Scheduler output
+
+        Returns:
+            dict[str, Any]: Encoder attention metadata
+        """
+        num_reqs = self.input_batch.num_reqs
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        # Get the number of scheduled tokens for each request.
+        req_ids = self.input_batch.req_ids
+        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        max_num_scheduled_tokens = max(tokens)
+
+        dummy_block_table = torch.zeros((num_reqs, 1),
+                                        dtype=torch.int32,
+                                        device=self.device)
+        dummy_slot_mapping = torch.zeros((total_num_scheduled_tokens, ),
+                                         dtype=torch.int32,
+                                         device=self.device)
+
+        group_metadata = dict[str, tuple[CommonAttentionMetadata, Any]]()
+
+        for attn_group_list in self.attn_groups:
+
+            assert len(attn_group_list) == 1
+            attn_group = attn_group_list[0]
+
+            # Use the first attention metadata builder
+            # to create encoder attention metadata
+            builder = attn_group.metadata_builder
+
+            common_metadata = CommonAttentionMetadata(
+                query_start_loc=self.query_start_loc[:num_reqs + 1],
+                query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs + 1],
+                seq_lens=self.seq_lens[:num_reqs],
+                seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
+                num_computed_tokens_cpu=self.input_batch.
+                num_computed_tokens_cpu_tensor[:num_reqs],
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                max_seq_len=self.seq_lens_cpu[:num_reqs].max().item(),
+                block_table_tensor=dummy_block_table,
+                slot_mapping=dummy_slot_mapping,
+                causal=False,
+            )
+
+            metadata = builder.build(
+                common_prefix_len=0,  # No cascade for encoder
+                common_attn_metadata=common_metadata,
+            )
+
+            for layer_name in attn_group.layer_names:
+                group_metadata[layer_name] = (common_metadata, metadata)
+
+        return group_metadata
