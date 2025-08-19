@@ -520,7 +520,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 x_scale = None
             else:
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
+                    *x.shape[:-1], -1)
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -549,6 +550,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self._get_tile_tokens_dim(x, top_k),
                 1 if renormalize else 0,  # routing_method_type, renormalize
                 True,  # do finalize
+                # TODO: use the maximum number in the cudagraph_batch_sizes
+                tune_max_num_tokens=8192,
             )[0]
             return trtllm_gen_output
         else:
