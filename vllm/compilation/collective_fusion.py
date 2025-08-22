@@ -1120,19 +1120,19 @@ class AllReduceFusionPass(VllmInductorPass):
                 self.device,
                 self.allreduce_params,
             ).register(self.patterns)
-            if current_platform.has_device_capability(100):
-                AllReduceFusedRMSNormStaticQuantNVFP4Pattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                    self.allreduce_params,
-                ).register(self.patterns)
-                AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                    self.allreduce_params,
-                ).register(self.patterns)
+            # if current_platform.has_device_capability(100):
+            #     AllReduceFusedRMSNormStaticQuantNVFP4Pattern(
+            #         epsilon,
+            #         self.model_dtype,
+            #         self.device,
+            #         self.allreduce_params,
+            #     ).register(self.patterns)
+            #     AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(
+            #         epsilon,
+            #         self.model_dtype,
+            #         self.device,
+            #         self.allreduce_params,
+            #     ).register(self.patterns)
             AllReduceRMSNormPattern(
                 epsilon,
                 self.model_dtype,
