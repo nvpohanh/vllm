@@ -397,9 +397,9 @@ if flashinfer_comm is not None:
     # to use flashinfer fused allreduce
     _FI_MAX_SIZES = {
         2: 64 * MiB,  # 64MB
-        4: MiB,  # 1MB
-        6: MiB // 2,  # 512KB
-        8: MiB // 2,  # 512KB
+        4: 32 * MiB,  # 32MB
+        6: 32 * MiB,  # 32KB
+        8: 32 * MiB,  # 32KB
     }
     # opt for a more conservative default value
     # when world size is not in _FI_MAX_SIZES
