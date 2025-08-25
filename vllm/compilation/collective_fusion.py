@@ -398,8 +398,8 @@ if flashinfer_comm is not None:
     _FI_MAX_SIZES = {
         2: 64 * MiB,  # 64MB
         4: 32 * MiB,  # 32MB
-        6: 32 * MiB,  # 32KB
-        8: 32 * MiB,  # 32KB
+        6: 16 * MiB,  # 16MB
+        8: 16 * MiB,  # 16MB
     }
     # opt for a more conservative default value
     # when world size is not in _FI_MAX_SIZES
