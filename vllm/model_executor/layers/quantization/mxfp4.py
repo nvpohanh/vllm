@@ -88,14 +88,22 @@ def get_mxfp4_backend():
 
         # If FlashInfer is not available, try either Marlin or Triton
         if current_platform.get_device_capability()[0] < 9:
+            # marlin kernel has better performance on pre-hopper GPUs
             logger.info_once("Using Marlin backend")
             return Mxfp4Backend.MARLIN
-        elif has_triton_kernels():
-            logger.info_once("Using Triton backend")
-            return Mxfp4Backend.TRITON
+        elif not has_triton_kernels():
+            # if triton kernels are not available, use marlin kernel
+            logger.info_once("Using Marlin backend")
+            return Mxfp4Backend.MARLIN
         elif not is_torch_equal_or_newer("2.8.0"):
+            # marlin kernel has better performance on torch 2.7.0 and below
             logger.info_once("Using Marlin backend")
             return Mxfp4Backend.MARLIN
+        else:
+            logger.info_once("Using Triton backend")
+            # otherwise, use triton kernels
+            return Mxfp4Backend.TRITON
+
     elif current_platform.is_rocm() and has_triton_kernels():
         logger.info_once("Using Triton backend")
         return Mxfp4Backend.TRITON
